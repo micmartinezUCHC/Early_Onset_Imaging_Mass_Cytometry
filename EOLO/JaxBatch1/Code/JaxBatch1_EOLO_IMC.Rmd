@@ -1,0 +1,853 @@
+---
+title: "JaxBatch1_ReDo"
+author: "Mike Martinez"
+date: "2023-11-14"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading libraries, set working directory}
+setwd("/Users/mikemartinez/Desktop/EOLO/EOLO/JaxBatch1/")
+library(imcRtools)
+library(cytomapper)
+library(pheatmap)
+```
+
+Read in the steinbock output into a `SpatialExperiment` object
+```{r read steinbock}
+# Read in the steinbock output folder
+spe <- read_steinbock("/Users/mikemartinez/Desktop/EOLO/EOLO/JaxBatch1/steinbock/")
+
+# OR....
+
+#Read in the spe object
+spe <- readRDS("/Users/mikemartinez/Desktop/EOLO/EOLO/JaxBatch1/RDS_objects/Kmeans_clustered_spe.rds")
+```
+
+```{r Formatting spatial experiment object}
+# Format sample_id, colnames, and rownames
+spe$sample_id <- sub("12222021_Rosenberg_TMA_1_", "ROI_", spe$sample_id)
+colnames(spe) <- paste0(spe$sample_id, "_", spe$ObjectNumber)
+rownames(spe) <- c("aSMA", "Vimentin", "CD14", "CD31", "CD56", "CD20", "CD45RA", "CD11c", "CD4", "Epcam_ECadherin", "MHC_II", "CD8a", "CD68", "CD45", "CD15",
+                   "FOXP3", "Tryptase", "GZMB", "Ki67", "Collagen_I", "CD3", "MHC_I", "CD45RO", "Pan_Keratin", "DNA1", "DNA3")
+
+# Specify the channels to be used in downstream analysis. Since DNA1 and DNA3 are just DNA intercolators, we will ignore them moving forward
+rowData(spe)$use_channel <- !grepl("DNA1|DNA3", rownames(spe))
+```
+
+```{r transform counts, de-select nuclear markers for downstream analysis}
+library(dittoSeq)
+
+# Plot the nuclear marker expression before asinh transforming
+dittoRidgePlot(spe, var = c("DNA1", "DNA3"), group.by = "sample_id", assay = "counts") +
+  ggtitle("Nuclear Markers: Before asinh Transformation")
+
+# asinh transform
+assay(spe, "exprs") <- asinh(counts(spe)/1)
+dittoRidgePlot(spe, var = c("DNA1", "DNA3"), group.by = "sample_id", assay = "exprs") +
+  ggtitle("Nuclear Markers: After asinh Transformation")
+
+# All markers
+markers <- unique(rownames(spe))
+
+#----- Run this to check the cytoplasmic markers
+# Iterate through each cytoplasmic marker and plot before and after asinh transformation
+for (marker in markers) {
+  before <- dittoRidgePlot(spe, var = marker, group.by = "sample_id", assay = "counts") +
+              ggtitle(paste(marker, "Before asinh transformation", sep = " "))
+  #ggsave(paste(marker, "Before_asinh_transformation.pdf", sep = "_"), before)
+  
+  after <- dittoRidgePlot(spe, var = marker, group.by = "sample_id", assay = "exprs") +
+            ggtitle(paste(marker, "After asinh transformation", sep = " "))
+  #ggsave(paste(marker, "After_asinh_transformation.pdf", sep = "_"), after)
+}
+```
+
+```{r load in images and masks}
+library(cytomapper)
+
+# Read in images and masks
+images <- loadImages("/Users/mikemartinez/Desktop/EOLO/EOLO/JaxBatch1/steinbock/img/")
+masks <- loadImages("/Users/mikemartinez/Desktop/EOLO/EOLO/JaxBatch1/steinbock/masks_deepcell/", as.is = TRUE)
+
+# Set channel names for images...should match spe
+channelNames(images) <- rownames(spe)
+names(images) <- sub("12222021_Rosenberg_TMA_1_", "ROI_", names(images))
+names(masks) <- sub("12222021_Rosenberg_TMA_1_", "ROI_", names(masks))
+
+# Set image names
+mcols(images) <- mcols(masks) <- DataFrame(sample_id = names(images))
+```
+
+```{r metadata}
+library(RColorBrewer)
+
+# Read in the metadata
+meta <- read.csv("/Users/mikemartinez/Desktop/EOLO/EOLO/JaxBatch1/Metadata/JaxBatch1_Meta.csv", header = TRUE, sep = ",")
+
+# Get a vector of sample IDs
+Sample_ID <- names(images)
+
+# Assign metadata for patient_id
+spe$patient_id <- meta$Patient_ID[match(spe$sample_id, meta$Sample_ID)]
+spe$patient_id <- factor(spe$patient_id)
+patient <- c("2955", "925", "5057", "7341")
+
+# Assign metadata for indication
+spe$indication <- meta$Indication[match(spe$sample_id, meta$Sample_ID)]
+indication <- c("Early", "Early", "Late", "Late", "Early", "Early", "Late", "Late")
+
+# Assign metadata for type
+spe$type <- meta$Type[match(spe$sample_id, meta$Sample_ID)]
+Type <- c("NonTumor", "Tumor")
+
+#Assign the metadata to the images and masks as well
+mcols(images) <- mcols(masks) <- DataFrame(sample_id = names(images),
+                                           patient_id = patient,
+                                           indication = indication,
+                                           type = Type)
+
+#Initialize an empty list to store color vectors which will be stored in the spe metadata slot
+color_vectors <- list()
+
+# patient_id color vector
+patient_id <- setNames(brewer.pal(length(unique(spe$patient_id)), name = "RdBu"),
+                                  unique(spe$patient_id))
+# sample_id color vector
+sample_id <- setNames(brewer.pal(length(unique(spe$sample_id)), name = "Paired"),
+                                 unique(spe$sample_id))
+# type color vector 
+type <- c("NonTumor" = "green",
+          "Tumor" = "orange")
+
+# indication color vector
+indication <- c("Late" = "red",
+                "Early" = "blue")
+
+# Append color vectors to to color_vectors list
+color_vectors$patient_id <- patient_id
+color_vectors$sample_id <- sample_id
+color_vectors$indication <- indication
+color_vectors$type <- type
+
+# Assign color_vectors list to metadata slot of spe
+metadata(spe)$color_vectors <- color_vectors
+```
+
+
+```{r segmentation quality control 1: Masks on ROIs}
+library(dittoSeq)
+library(viridis)
+library(cytomapper)
+library(gridGraphics)
+library(cowplot)
+
+# Seed seed for reproducibility
+set.seed(03061999)
+
+# Randomly sample 2 ROIs out of the 8 ROIs
+img_ids <- sample(seq_along(images), 2)
+cur_images <- images[img_ids]
+cur_masks <- masks[img_ids]
+
+# 2 step normalization scheme. Normalize across images --> normalize within images.
+cur_images <- cytomapper::normalize(cur_images, separateImages = TRUE)
+cur_images <- cytomapper::normalize(cur_images, inputRange = c(0,0.2))
+
+# Look at the segmentation using a nuclear marker and a few cytoplasmic markers
+segmentQC <- plotPixels(image = cur_images,
+           mask = cur_masks,
+           object = spe,
+           cell_id = "ObjectNumber", 
+           img_id = "sample_id",
+           missing_colour = "white",
+           colour_by = c("DNA1","Epcam_ECadherin", "CD3", "CD20"),
+           colour = list(DNA1 = c("black", "blue"),
+                         Epcam_ECadherin = c("black", "green"),
+                         CD3 = c("black", "red"),
+                         CD20 = c("black", "orange")),
+           image_title = NULL,
+           legend = list(colour_by.title.cex = 0.7,
+                         colour_by.labels.cex = 0.7),
+           return_plot = TRUE)
+
+# Plot and save
+QC <- ggdraw(segmentQC$plot, clip = "on")
+ggsave("segmentationQC.png", QC, width =12, height = 8)
+```
+
+```{r segmentation quality control 2: Single-cell patterns}
+library(dittoSeq)
+library(viridis)
+
+# Sub-sample the cells
+cur_cells <- sample(seq_len(ncol(spe)), 2000)
+
+# Plot heatmap
+scMarkerPatterns <- dittoHeatmap(spe[,cur_cells],
+             assay = "exprs",
+             cluster_cols = FALSE,
+             scale = "none",
+             annot.by = c("indication", "type"),
+             annotation_colors = list(indication = metadata(spe)$color_vectors$indication,
+                                      type = metadata(spe)$color_vectors$type),
+             heatmap.colors = viridis(100),
+             main = "Single-cell Expression Patterns Across Samples")
+ggsave("MarkerPatterns_acrossPatients_ROIs.pdf", scMarkerPatterns, width = 10, height = 8)
+```
+
+```{r segmentation quality control 3: Mean marker expression per image}
+library(scuttle)
+
+# Aggregate cells and calculate the mean expression
+image_mean <- aggregateAcrossCells(spe,
+                                   ids = spe$sample_id,
+                                   statistics = "mean",
+                                   use.assay.type = "counts")
+assay(image_mean, "exprs") <- asinh(counts(image_mean))
+
+# Plot heatmap 
+markerExpression <- dittoHeatmap(image_mean,
+             assay = "exprs",
+             cluster_cols = FALSE,
+             scale = "none",
+             heatmap.colors = viridis(100),
+             annot.by = c("patient_id", "sample_id"),
+             annotation_colors = list(patient_id = metadata(spe)$color_vectors$patient_id,
+                                      sample_id = metadata(spe)$color_vectors$sample_id),
+             show_colnames = TRUE,
+             main = "Marker Expression Levels Across All Images")
+ggsave("PerImage_MarkerExpression.pdf", markerExpression, width = 10, height = 8)
+
+```
+
+#-----For below: 65536 is a number representative of the number of intensity levels in a 16-bit images (which Steinbock outputs)
+16-bit images have 2^16 = 65536 intensity levels
+
+```{r Image quality control 1A: Signal to noise ratio}
+library(tidyverse)
+library(ggrepel)
+library(EBImage)
+
+# Calculate the signal to noise ratio
+cur_snr <- lapply(names(images), function(x){
+  img <- images[[x]]
+  mat <- apply(img, 3, function(ch){
+    # Otsu threshold
+    thres <- otsu(ch, range = c(min(ch), max(ch)), levels = 65536)
+    # Signal-to-noise ratio
+    snr <- mean(ch[ch > thres]) / mean(ch[ch <= thres])
+    # Signal intensity
+    ps <- mean(ch[ch > thres])
+    
+    return(c(snr = snr, ps = ps))
+  })
+  t(mat) %>% as.data.frame() %>%
+    mutate(image = x, 
+           marker = colnames(mat)) %>%
+    pivot_longer(cols = c(snr, ps))
+})
+
+cur_snr <- do.call(rbind, cur_snr)
+
+# Plot SNR
+cur_snr %>%
+  group_by(marker, name) %>%
+  summarize(log_mean = log2(mean(value))) %>%
+  pivot_wider(names_from = name, values_from = log_mean) %>%
+  ggplot() +
+  geom_point(aes(ps, snr)) +
+  geom_label_repel(aes(ps, snr, label = marker)) +
+  theme_minimal(base_size = 15) + ylab("Signal-to-noise ratio [log2]") +
+  xlab("Signal intensity [log2]")
+```
+
+```{r Image quality control 1B: Signal to noise ratio}
+cur_snr <- cur_snr %>%
+  pivot_wider(names_from = name, values_from = value) %>%
+  filter(ps > 2) %>%
+  pivot_longer(cols = c(snr, ps))
+
+# Plot
+cur_snr %>%
+  group_by(marker, name) %>%
+  summarize(log_mean = log2(mean(value))) %>%
+  pivot_wider(names_from = name, values_from = log_mean) %>%
+  ggplot() +
+  geom_point(aes(ps, snr)) +
+  geom_label_repel(aes(ps, snr, label = marker)) +
+  theme_minimal(base_size = 15) + ylab("Signal-to-noise ratio [log2]") +
+  xlab("Signal Intensity [log2]")
+
+```
+
+```{r Image quality control 2: Cell Area}
+
+# Calculate the number of pixels covered by cells
+cell_density <- colData(spe) %>%
+  as.data.frame() %>%
+  group_by(sample_id) %>%
+  
+  # Divide the total number of pixels by the number of pixels covered by cells
+  summarize(cell_area = sum(area),
+            no_pixels = mean(width_px) * mean(height_px)) %>%
+  mutate(covered_area = cell_area / no_pixels)
+
+# Plot
+cellCoverage <- ggplot(cell_density) +
+  geom_point(aes(reorder(sample_id, covered_area), covered_area)) +
+  theme_minimal(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 15)) +
+  ylim(c(0,1)) +
+  ylab("% Covered area") + xlab("")
+ggsave("Percent_Covered_Area_per_Image.pdf", cellCoverage, width = 10, height = 8)
+
+```
+
+```{r Image quality control 3: SNR at cell level using Gaussian Mixture Models}
+library(mclust)
+
+# Set seed for reproducibility
+set.seed(03061999)
+
+mat <- sapply(seq_len(nrow(spe)), function(x){
+  cur_exprs <- assay(spe, "exprs")[x,]
+  cur_counts <- assay(spe, "counts")[x,]
+  
+  cur_model <- Mclust(cur_exprs, G = 2)
+  mean1 <- mean(cur_counts[cur_model$classification == 1])
+  mean2 <- mean(cur_counts[cur_model$classification == 2])
+  
+  signal <- ifelse(mean1 > mean2, mean1, mean2)
+  noise <- ifelse(mean1 > mean2, mean2, mean1)
+  
+  return(c(snr = signal/noise, ps = signal))
+})
+
+cur_snr <- t(mat) %>% as.data.frame() %>%
+  mutate(marker = rownames(spe))
+
+cur_snr %>% ggplot() +
+  geom_point(aes(log2(ps), log2(snr))) +
+  geom_label_repel(aes(log2(ps), log2(snr), label = marker)) +
+  theme_minimal(base_size = 15) + ylab("Signal-to-noise ratio [log2]")+
+  xlab("Signal intensity [log2]")
+
+```
+
+```{r Image quality control 4: Cell Sizes Across All ROIs}
+
+# Calculate the distribution of cell sizes across each ROI
+dist <- dittoPlot(spe, var = "area",
+          group.by = "sample_id",
+          plots = "boxplot") +
+  ylab("Cell area") + xlab("") +
+  ggtitle("Distribution of cell sizes across images")
+ggsave("CellSize_Distributions_Across_Images.pdf", dist, width = 10, height = 8)
+
+# Summarize the cell areas
+summary(spe$area)
+
+```
+
+```{r Image quality control 5: Removing Small Cells}
+sum(spe$area < 5)
+spe <- spe[,spe$area >= 5]
+```
+
+```{r Image quality control 6: Cell Density and Marker Expression Across Patients}
+
+# Calculate the cell density
+cell_density <- colData(spe) %>%
+  as.data.frame() %>%
+  group_by(sample_id) %>%
+  summarize(cell_count = n(),
+            no_pixels = mean(width_px) * mean(height_px)) %>%
+  mutate(cells_per_mm2 = cell_count/(no_pixels/1000000))
+
+# Plot
+cellDensity <- ggplot(cell_density) +
+  geom_point(aes(reorder(sample_id, cells_per_mm2), cells_per_mm2)) +
+  theme_minimal(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8)) +
+  ylab("Cells per mm2") + xlab("") + ggtitle("Cell Density per Image")
+ggsave("CellDensity_Per_Image.pdf", cellDensity, width = 10, height = 8)
+
+# Plot marker expression for each patient
+multiDitto <- multi_dittoPlot(spe, vars = rownames(spe)[rowData(spe)$use_channel],
+                group.by = "patient_id", plots = "ridgeplot",
+                assay = "exprs",
+                legend.show = FALSE,
+                color.panel = metadata(spe)$color_vectors$patient_id)
+ggsave("MultiDitto.pdf", multiDitto, width = 12, height = 16)
+```
+
+```{r Analysis 1A: Dimensional Reduction}
+library(scater)
+
+# Set seed for reproducibility
+set.seed(03061999)
+
+# Run UMAP and tSNE
+spe <- runUMAP(spe, exprs_values = "exprs")
+#spe <- runTSNE(spe, exprs_values = "exprs")
+
+# Dimensional reductions are stored in the reducedDims slot of spe
+reducedDims(spe)
+
+```
+
+```{r Analysis 1B: Visualize Dimensional Reduction}
+library(patchwork)
+library(ggplot2)
+
+# Visualize sample ID
+p1 <- dittoDimPlot(spe, var = "sample_id", reduction.use = "UMAP", size = 0.2) +
+  scale_colour_manual(values = metadata(spe)$color_vectors$sample_id)
+  ggtitle("Sample ID on UMAP")
+# p2 <- dittoDimPlot(spe, var = "sample_id", reduction.use = "TSNE", size = 0.2) +
+#   scale_colour_manual(values = metadata(spe)$color_vectors$sample_id)
+#   ggtitle("Sample ID on UMAP")
+
+# Visualize Indication
+p3 <- dittoDimPlot(spe, var = "indication", reduction.use = "UMAP", size = 0.2) +
+  scale_colour_manual(values = metadata(spe)$color_vectors$indication)
+  ggtitle("Sample ID on UMAP")
+# p4 <- dittoDimPlot(spe, var = "indication", reduction.use = "TSNE", size = 0.2) +
+#   scale_colour_manual(values = metadata(spe)$color_vectors$indication)
+#   ggtitle("Sample ID on UMAP") 
+  
+# Visualize patient ID
+p5 <- dittoDimPlot(spe, var = "patient_id", reduction.use = "UMAP", size = 0.2) +
+  scale_colour_manual(values = metadata(spe)$color_vectors$patient_id)
+  ggtitle("Sample ID on UMAP")
+# p6 <- dittoDimPlot(spe, var = "patient_id", reduction.use = "TSNE", size = 0.2) +
+#   scale_colour_manual(values = metadata(spe)$color_vectors$patient_id)
+#   ggtitle("Sample ID on UMAP") 
+
+# Plot
+#final <- (p1 + p2) / (p3 + p4) / (p5 + p6)
+final <- (p1 + p3) / (p5)
+ggsave("DimReduction.pdf", final, width = 12, height = 14)
+
+```
+
+```{r Analysis 2A: Batch Correction}
+library(batchelor)
+
+# Set seed for reproducibility
+set.seed(03061999)
+
+# Calculate fastMNN batch correction
+out <- fastMNN(spe, batch = spe$patient_id,
+               auto.merge = TRUE,
+               subset.row = rowData(spe)$use_channel,
+               assay.type = "exprs")
+
+# Check that order of cells is the same
+stopifnot(all.equal(colnames(spe), colnames(out)))
+
+# Transfer the correction results to the main spe object
+reducedDim(spe, "fastMNN") <- reducedDim(out, "corrected")
+
+# Save RDS object at this point
+#saveRDS(spe, "integrated_JaxBatch1.rds")
+```
+
+```{r Analysis 2B: Batch Correction QC Assessment}
+library(scater)
+
+# Get the batch correction info
+merge_info <- metadata(out)$merge.info
+merge_info[,c("left", "right", "batch.size")]
+merge_info$lost.var
+
+# Set seed for reproducibility
+set.seed(03061999)
+
+# Run UMAP on the batch corrected data
+spe <- runUMAP(spe, dimred = "fastMNN", name = "UMAP_mnnCorrected")
+```
+
+```{r Analysis 2C: Visualizing Batch Corrected UMAP}
+library(cowplot)
+library(dittoSeq)
+library(viridis)
+
+# visualize patient id before and after MNN correction
+p1 <- dittoDimPlot(spe, var = "patient_id",
+                   reduction.use = "UMAP", size = 0.2) +
+  scale_color_manual(values = metadata(spe)$color_vectors$patient_id)+
+  ggtitle("Patient ID on UMAP Before Correction")
+p2 <- dittoDimPlot(spe, var = "patient_id",
+                   reduction.use = "UMAP_mnnCorrected", size = 0.2) +
+  scale_color_manual(values = metadata(spe)$color_vectors$patient_id) +
+  ggtitle("Patient ID on UMAP After Correction")
+
+# Plot
+correctedUMAP <- plot_grid(p1, p2)
+ggsave("FastMNN_Corrected_UMAP.pdf", correctedUMAP, width = 14, height = 14)
+
+# visualize sample id after MNN correction
+p3 <- dittoDimPlot(spe, var = "sample_id",
+                   reduction.use = "UMAP_mnnCorrected", size = 0.2) +
+  scale_color_manual(values = metadata(spe)$color_vectors$sample_id) +
+  ggtitle("Sample ID on UMAP After Correction")
+
+# visualize indication after MNN correction
+p4 <- dittoDimPlot(spe, var = "indication",
+                   reduction.use = "UMAP_mnnCorrected", size = 0.2) +
+  scale_color_manual(values = metadata(spe)$color_vectors$indication) +
+  ggtitle("Indication ID on UMAP After Correction")
+
+# visualize type after MNN correction
+p5 <- dittoDimPlot(spe, var = "type",
+                   reduction.use = "UMAP_mnnCorrected", size = 0.2) +
+  scale_color_manual(values = metadata(spe)$color_vectors$type) +
+  ggtitle("Tumor-Type ID on UMAP After Correction")
+
+# Plot as a grid
+SampleAndPatient <- plot_grid(p2, p3, p4, p5)
+ggsave("Patient_And_Sample_Corrected_UMAP.png", SampleAndPatient, width = 12, height = 8)
+
+```
+
+```{r Analysis 3: Visualizing Each Marker on MNN Corrected UMAP}
+
+# All markers
+markers <- rownames(spe)
+
+# Plot each marker on the MNN corrected UMAP
+plot_list <- multi_dittoDimPlot(spe, var = markers, reduction.use = "UMAP_mnnCorrected",
+                                assay = "exprs", size = 0.2, list.out = TRUE)
+plot_list <- lapply(plot_list, function(x) x + scale_color_viridis())
+after <- plot_grid(plotlist = plot_list)
+ggsave("FastMNN_Corrected_Markers_UMAP.png", after, width = 22, height = 18)
+
+```
+
+```{r Analysis 4A: Kmeans Clustering with 10 centers}
+library(bluster)
+library(BiocParallel)
+library(ggplot2)
+library(scran)
+
+# Set seed for reproducibility
+set.seed(03061999)
+
+# Cluster the cells, specifying 10 centers
+clusters <- clusterCells(spe,
+                         use.dimred = "fastMNN",
+                         BLUSPARAM = KmeansParam(centers = 10))
+
+# Append clusters to the spe object
+spe$k_clusters <- clusters
+
+# Plot the clusters on MNN corrected UMAP
+Kmeans_Clusters <- dittoDimPlot(spe, var = "k_clusters",
+            reduction.use = "UMAP_mnnCorrected", size = 0.2,
+            do.label = TRUE) +
+  ggtitle("Kmeans Clusters on UMAP, Integrated Cells")
+ggsave("Kmeans_clusters_on_UMAP.pdf", Kmeans_Clusters, width = 10, height = 10)
+```
+
+```{r Analysis 4B: Assign colors to KMeans Clusters}
+
+# Assign color vector to KMeans Clusters
+KMclusters <- setNames(brewer.pal(length(unique(spe$k_clusters)), name = "PiYG"),
+                                  unique(spe$k_clusters))
+
+# Initializ empty list to store cluster color metadata
+cluster_colors <- list()
+
+# Append KMclusters color vector to list
+cluster_colors$KMclusters <- KMclusters
+
+# Append cluster_colors list to metadata slot of spe
+metadata(spe)$cluster_colors <- cluster_colors
+```
+
+```{r Analysis 4C: KMeans Clusters Heatmap}
+
+# Sample the cells
+cur_cells <- sample(seq_len(ncol(spe)), 2000)
+
+# Plot heatmap of clusters
+K_clusterHM <- dittoHeatmap(spe[,cur_cells],
+             genes = rownames(spe),
+             assay = "exprs", scale = "none",
+             heatmap.colors = viridis(100), 
+             annot.by = c("k_clusters", "sample_id"),
+             annotation_colors = list(KMClusters = metadata(spe)$cluster_colors$KMclusters,
+                                      sample_id = metadata(spe)$color_vectors$sample_id))
+ggsave("Kmeans_Clusters_Heatmap.pdf", K_clusterHM, width = 8, height = 8)
+
+```
+
+```{r Analysis 5A: Phenotyping}
+library(dplyr)
+
+# Assign cluster phenotype labels
+phenotypes <- recode(spe$k_clusters,
+                           "1" = "Granulocytes",
+                           "2" = "Fibroblasts",
+                           "3" = "B-cells",
+                           "4" = "Monocytes",
+                           "5" = "Non-proliferating Epithelia",
+                           "6" = "Proilferating Epithelia",
+                           "7" = "Mast Cells",
+                           "8" = "CAFs",
+                           "9" = "T-cells",
+                           "10" = "Normal Mesenchymal")
+spe$phenotypes <- phenotypes
+
+# Plot MNN corrected UMAP with new cluster labels
+phenotypedClusters <- dittoDimPlot(spe, var = "phenotypes",
+            reduction.use = "UMAP_mnnCorrected", size = 0.2,
+            do.label = TRUE) +
+  ggtitle("Phenotyped Clusters on UMAP, Integrated Cells")
+ggsave("Phenotyped_mnnCorrected_Clusters.pdf", phenotypedClusters, width = 12, height = 8)
+
+# Plot as heatmap
+phenotyped_clusterHM <- dittoHeatmap(spe[,cur_cells],
+             genes = rownames(spe),
+             assay = "exprs", scale = "none",
+             heatmap.colors = viridis(100), 
+             annot.by = c("phenotypes",
+                          "patient_id",
+                          "sample_id",
+                          "indication",
+                          "type"))
+ggsave("Phenotyped_Clusters_Heatmap.pdf", phenotyped_clusterHM, width = 12, height = 8)
+
+```
+
+```{r 5B: Assigning colors to phenotypes clusters}
+# Assign colors to each cluster
+phenoColors <- setNames(c("#3F1B03", "#F4AD31", "#894F36", "#1C750C", "#EF8ECC", 
+                       "#6471E2", "#4DB23B", "grey", "#F4800C", "#BF0A3D"),
+                     c("1" = "Granulocytes",
+                           "2" = "Fibroblasts",
+                           "3" = "B-cells",
+                           "4" = "Monocytes",
+                           "5" = "Non-proliferating Epithelia",
+                           "6" = "Proilferating Epithelia",
+                           "7" = "Mast Cells",
+                           "8" = "CAFs",
+                           "9" = "T-cells",
+                           "10" = "Normal Mesenchymal"))
+   
+# Initialize empty list for cluster colors metadata                  
+cluster_colors <- list()
+
+# Append colors to list
+cluster_colors$phenotypes <- phenoColors
+
+# Append list to metadata slot
+metadata(spe)$cluster_colors <- cluster_colors
+```
+
+```{r Analysis 6A: Single Cell Visualization: Heatmaps}
+library(scuttle)
+
+# Aggregate acriss cells, calculate the mean expression of each marker
+celltype_mean <- aggregateAcrossCells(as(spe, "SingleCellExperiment"),
+                                      ids = spe$phenotypes,
+                                      statistics = "mean",
+                                      use.assay.type = "exprs",
+                                      subset.row = rownames(spe))
+
+# Heatmap: no scaling
+dittoHeatmap(celltype_mean,
+             assay = "exprs",
+             cluster_cols = TRUE,
+             scale = "none",
+             heatmap.colors = viridis(100),
+             annot.by = c("phenotypes", "ncells"))
+
+# Max- Scaled
+# In max scaling, each feature is scaled to a specific range (min value = 0, max value = 1, and in betwen are scaled linearly)
+# Sensitive to outliers because it is based on the minimum and maximum values
+# Use when the features have a known, meaningful maximum and minimum.
+
+# Heatmap: min/max scaled
+maxScaled <- dittoHeatmap(celltype_mean,
+             assay = "exprs",
+             cluster_cols = TRUE,
+             scaled.to.max = TRUE,
+             heatmap.colors.max.scaled = inferno(100),
+             annot.by = c("phenotypes", "ncells"),
+             annotation_colors = list(ncells = plasma(100)))
+ggsave("Max_Scaled_Expression_of_clusters.pdf", maxScaled, width = 10, height = 8)
+
+
+# Z-score scaled
+# Each feature is standardized (has a mean of 0 and a standard deviation of 1. Achieved by subtracting the mean and dividing by the standard deviation)
+# Used in situations where the data is assumed to be normal
+
+# Heatmap: Z-scaled
+Zscaled <- dittoHeatmap(celltype_mean,
+             assay = "exprs",
+             cluster_cols = TRUE,
+             heatmap.colors.max.scaled = inferno(100),
+             annot.by = c("phenotypes", "ncells"),
+             annotation_colors = list(ncells = plasma(100)))
+ggsave("Z_Scaled_Expression_of_clusters.pdf", Zscaled, width = 10, height = 8)
+```
+
+
+```{r Analysis 6B: Single Cell Visualization: Stacked Barplot}
+StackedBar <- dittoBarPlot(spe,
+             var = "phenotypes",
+             group.by = "sample_id") +
+  ggtitle("Cell-type composition of ROIs")
+
+ggsave("StackedBar_Composition_of_ROIs.pdf", StackedBar, width = 10, height = 8)
+
+
+
+```
+
+```{r Analysis 7: Project clusters onto the ROIs}
+library(gridGraphics)
+
+# Cluster projections
+projections <- plotCells(cur_masks,
+          object = spe,
+          cell_id = "ObjectNumber",
+          img_id = "sample_id",
+          colour_by = "phenotypes",
+          return_plot = TRUE)
+
+# Plot
+p1 <- ggdraw(projections$plot, clip = "on")
+ggsave("Projected_Clusters.pdf", p1, width =12, height = 8)
+
+```
+
+This loop is too memory intensive...do not run.
+```{r , eval = FALSE}
+for (img in names(images)) {
+  
+  norm_img <- cytomapper::normalize(img, inputRange = c(0,0.2))
+  norm_mask <- masks[img]
+
+  # Look at the segmentation using a nuclear marker and a few cytoplasmic markers
+  plotPixels(image = norm_img,
+            mask = norm_mask,
+            object = spe,
+            cell_id = "ObjectNumber", 
+            img_id = "sample_id",
+            missing_colour = "white",
+            colour_by = c("DNA1","Epcam_ECadherin", "CD3", "CD20"),
+            colour = list(DNA1 = c("black", "blue"),
+                          Epcam_ECadherin = c("black", "green"),
+                          CD3 = c("black", "red"),
+                          CD20 = c("black", "orange")),
+            image_title = NULL,
+            legend = list(colour_by.title.cex = 0.7,
+                          colour_by.labels.cex = 0.7))
+}
+```
+
+```{r Analysis 8: Plot Pixels for Each ROI Manually}
+library(gridGraphics)
+
+# Manually go through and make the images for each ROI because your computer cannot handle doing it in a loop.
+ROI1 <- images["ROI_008"]
+Mask1 <- masks["ROI_008"]
+cur_1 <- cytomapper::normalize(ROI1, inputRange = c(0,0.2))
+
+# Look at the segmentation using a nuclear marker and a few cytoplasmic markers
+ROIplots <- plotPixels(image = cur_1,
+           mask = Mask1,
+           object = spe,
+           cell_id = "ObjectNumber", 
+           img_id = "sample_id",
+           missing_colour = "white",
+           colour_by = c("DNA1","Epcam_ECadherin", "CD3", "CD20"),
+           colour = list(DNA1 = c("black", "blue"),
+                         Epcam_ECadherin = c("black", "green"),
+                         CD3 = c("black", "red"),
+                         CD20 = c("black", "orange")),
+           image_title = NULL,
+           legend = list(colour_by.title.cex = 0.7,
+                         colour_by.labels.cex = 0.7),
+           return_plot = TRUE)
+
+# Plot
+ROI <- ggdraw(ROIplots$plot, clip = "on")
+ggsave("ROI8.pdf", ROI, width =12, height = 8)
+```
+
+From: https://bodenmillergroup.github.io/IMCDataAnalysis/
+12.1 Spatial Interaction Graphs
+Many spatial analysis approaches either compare the observed versus expected number of cells around a given cell type (point process) or utilize interaction grpahs (spatial object graphs) to estimate clustering or interaction frequencies between cell types.
+
+The `steinbock` framework allows for the construction of these sptial graphs. During image processing, we have constructed a spatial grapsh by expanding the individual cell masks by 4 pixels.
+
+The `imcRtools` package further allows the ad hoc construction of spatial graphs by directly using a `spatialExperiment` or `singleCellExperiment` object while considering the spatial location (centroids) of individual cells. The `buildSpatialGrpah` function allows constructing spatial graphs by detecting the k-nearest neighbors in 2D `(knn)`, by detecting all cells within a given distance to the center cell `(expansion)` and by Delaunay triagnulation `(delaunay)`.
+
+When constructing a knn graph, the number of neighbors `(k)` needs to be set and (optionally) the maximum distance to consider `(max_dist)` can be specified. When constructing a graph via expansion, the distance to expand `(threshold)` needs to be provided. For graphs constructed via Delaunay triangulation, the `max_dist` parameter can be set to avoid unusually large connections at the edge of the image.
+
+```{r Analysis 9A: Building Neighborhood Graphs}
+library(imcRtools)
+
+# Build spatial graphs
+spe <- buildSpatialGraph(spe, img_id = "sample_id", type = "knn", k = 20)
+spe <- buildSpatialGraph(spe, img_id = "sample_id", type = "expansion", threshold = 20)
+spe <- buildSpatialGraph(spe, img_id = "sample_id", type = "delaunay", max_dist = 20)
+```
+
+```{r Analysis 9B: Plotting Neighborhood Graphs}
+library(ggplot2)
+library(viridis)
+library(gridGraphics)
+
+# Steinbock interaction graph
+Spatial <- plotSpatial(spe[,spe$sample_id == "ROI_004"],
+            node_color_by = "CD15",
+            assay_type = "exprs",
+            img_id = "sample_id",
+            draw_edges = TRUE,
+            colPairName = "delaunay_interaction_graph",
+            nodes_first = FALSE,
+            node_size_by = "area",
+            directed = FALSE,
+            edge_color_fix = "grey") +
+  scale_size_continuous(range = c(0.1, 2)) +
+  ggtitle("ROI4: LOCRC Tumor - CD15 Delaunay Interaction") +
+  theme(legend.title = element_text(size = 30),
+        legend.text = element_text(size = 20),
+        axis.text.x = element_text(size = 30),
+        axis.text.y = element_text(size = 30),
+        title = element_text(size = 30))
+ggsave("CD15_ROI4_Delaunay.pdf", Spatial, width = 14, height = 12)
+```
+
+Here's a general guide on interpreting the Delaunay triangulation graph projected onto the ROI:
+1.) Spatial organization:
+  Triangles: Each triangle in the Delaunay Triangulation graph represents a set of three neighboring cells that are closely related in terms of their protein expression patterns. The edges of these triangles connect cells that are spatially close to each other.
+
+2.) Proximity and Interaction
+  Close proximity: Cells connected by edges in the Delaunay triangulation are likely to be in close spatial proximity to each other. This could indicate potential physical interactions or shared micro environments between these cells.
+  
+3.) Heterogeneity
+  Variability in Triangles: The presence of different-sized triangles or irregular patterns may indicate spatial heterogeneity in protein expression within the ROI. This could correspond to distinct cellular neighborhoods or micro environments.
+  
+4.) Functional Significance
+  Protein Co-expression Patterns: Consider the protein expression patterns of cells within each triangle. Are there specific combinations of proteins that tend to co localize spatially? This information can provide insights into potential functional relationships between cells.
+  
+5.) Biomarker Discovery
+  Identification of Key Cells: Cells located at the vertices of triangles or at the center of larger triangles might be of particular interest. These cells may exhibit unique protein expression profiles and could serve as potential biomarkers or indicators of specific cellular states or functions
+  
+
+
+
+
+
